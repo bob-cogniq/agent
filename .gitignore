@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+.env
+
+# cogniq runtime artifacts (not committed)
+.cogniq/issue.toml
+.cogniq/analysis.toml
+.cogniq/build-result.toml
+.cogniq/postmortem*.toml
+.cogniq/locks.toml
+.cogniq/run.lock
+.cogniq/retros/
+.cogniq/push-queue/
+
+# IDE
+.idea/
+.vscode/
+*.swp
