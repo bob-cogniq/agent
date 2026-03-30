@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from cogniq_shared.domain.enums import IssueStatus
 from cogniq_shared.domain.issue import Artifact, Event, Issue, IssueSummary, Run
+from cogniq_shared.domain.code_session import CodeMessage, CodeSession
 from cogniq_shared.domain.state_machine import StateMachine
 
 
@@ -157,6 +158,56 @@ class IssueRepository:
             {"_id": issue_id},
             {"$set": {"summary": summary.model_dump(), "updated_at": datetime.now(timezone.utc)}},
         )
+
+    # ── Code Sessions ──
+
+    async def add_code_session(self, issue_id: str, session: CodeSession) -> str:
+        await self._col.update_one(
+            {"_id": issue_id},
+            {
+                "$push": {"code_sessions": session.model_dump()},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return session.session_id
+
+    async def update_code_session(self, issue_id: str, session_id: str, updates: dict[str, Any]) -> None:
+        set_fields = {f"code_sessions.$.{k}": v for k, v in updates.items()}
+        set_fields["updated_at"] = datetime.now(timezone.utc)
+        await self._col.update_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {"$set": set_fields},
+        )
+
+    async def add_code_message(self, issue_id: str, session_id: str, message: CodeMessage) -> None:
+        await self._col.update_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {
+                "$push": {"code_sessions.$.messages": message.model_dump()},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+
+    async def list_code_sessions(self, issue_id: str) -> list[CodeSession]:
+        """Return sessions without messages (lightweight list)."""
+        doc = await self._col.find_one({"_id": issue_id}, {"code_sessions": 1})
+        if not doc or "code_sessions" not in doc:
+            return []
+        sessions = []
+        for s in doc["code_sessions"]:
+            s_copy = {**s, "messages": []}  # exclude messages for list view
+            sessions.append(CodeSession.model_validate(s_copy))
+        return sessions
+
+    async def get_code_session(self, issue_id: str, session_id: str) -> CodeSession | None:
+        """Return a single session with full messages."""
+        doc = await self._col.find_one({"_id": issue_id}, {"code_sessions": 1})
+        if not doc or "code_sessions" not in doc:
+            return None
+        for s in doc["code_sessions"]:
+            if s.get("session_id") == session_id:
+                return CodeSession.model_validate(s)
+        return None
 
     # ── Queries ──
 

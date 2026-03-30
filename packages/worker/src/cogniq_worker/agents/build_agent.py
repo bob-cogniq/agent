@@ -13,6 +13,7 @@ from cogniq_shared.domain.enums import ArtifactType, EventType, Stage
 from cogniq_shared.domain.issue import Project as ProjectModel, RepoConfig
 from cogniq_shared.domain.verification import VerifyResult, VerificationItemResult, DefaultsResult, PostReview, AdversarialFinding
 from cogniq_shared.integrations.github import GitHubClient
+from cogniq_shared.domain.code_session import CodeSession, CodeMessage, ChangedFile
 from cogniq_shared.registry.repository import IssueRepository
 
 logger = logging.getLogger(__name__)
@@ -99,11 +100,39 @@ class BuildAgent(BaseAgent):
             prompt = self._build_implementation_prompt(
                 plan_md, issue.title, issue.description, workspace, worktree_paths,
             )
+
+            # Create Code Session before running Claude Code
+            session = CodeSession(run_id=run_id, model="sonnet")
+            session_id = await self._repo.add_code_session(issue_id, session)
+
             code_result = await self._claude_code.run(
                 workspace_root=workspace.root_path,
                 worktree_paths=worktree_paths,
                 prompt=prompt,
             )
+
+            # Update Code Session with results
+            changed_files = await self._collect_changed_files(
+                worktree_paths, code_result.files_changed
+            )
+            file_tree = await self._collect_file_tree(worktree_paths, [f.path for f in changed_files])
+            session_updates: dict[str, Any] = {
+                "status": "completed" if code_result.success else "failed",
+                "cli_session_id": code_result.cli_session_id,
+                "total_turns": code_result.turns_used,
+                "total_tokens": {
+                    "input": code_result.total_input_tokens,
+                    "output": code_result.total_output_tokens,
+                },
+                "total_cost_usd": code_result.total_cost_usd,
+                "model": code_result.model or "sonnet",
+                "messages": [CodeMessage(**m).model_dump() for m in code_result.messages],
+                "changed_files": [f.model_dump() for f in changed_files],
+                "file_tree": file_tree,
+                "completed_at": datetime.now(timezone.utc),
+                "error": code_result.error[:500] if code_result.error else None,
+            }
+            await self._repo.update_code_session(issue_id, session_id, session_updates)
 
             if not code_result.success:
                 raise RuntimeError(f"Claude Code failed: {code_result.error[:500]}")
@@ -496,6 +525,124 @@ Original plan:
             if len(segments) >= 2:
                 return f"{segments[0]}/{segments[1]}"
         return ""
+
+    async def _collect_changed_files(
+        self, worktree_paths: dict[str, Path], raw_files: list[str],
+    ) -> list[ChangedFile]:
+        """Collect diff data only for files that Claude Code actually modified.
+
+        Uses raw_files (from Write/Edit tool_use) as the source of truth,
+        then enriches with git diff data for additions/deletions/diff_content.
+        """
+        if not raw_files:
+            return []
+
+        result: list[ChangedFile] = []
+        seen: set[str] = set()
+
+        for _repo_id, wt_path in worktree_paths.items():
+            wt_str = str(wt_path)
+            for raw_path in raw_files:
+                # Normalize: strip worktree prefix to get relative path
+                rel_path = raw_path
+                if raw_path.startswith(wt_str):
+                    rel_path = raw_path[len(wt_str):].lstrip("/")
+                elif "/" in raw_path:
+                    # Try to find the relative part by checking if file exists
+                    parts = raw_path.split("/")
+                    for i in range(len(parts)):
+                        candidate = "/".join(parts[i:])
+                        if (wt_path / candidate).exists():
+                            rel_path = candidate
+                            break
+
+                if rel_path in seen:
+                    continue
+                seen.add(rel_path)
+
+                try:
+                    full_path = wt_path / rel_path
+                    is_new = not await self._git_file_exists_in_head(wt_path, rel_path)
+                    status = "added" if is_new else "modified"
+
+                    # Get diff for this specific file
+                    diff_cmd = ["git", "diff", "HEAD", "--", rel_path] if not is_new else ["git", "diff", "--no-index", "/dev/null", rel_path]
+                    diff_proc = await asyncio.create_subprocess_exec(
+                        *diff_cmd, cwd=str(wt_path),
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    diff_out, _ = await diff_proc.communicate()
+                    diff_text = diff_out.decode("utf-8", errors="replace")[:50000]
+
+                    # Count additions/deletions from diff
+                    adds = sum(1 for line in diff_text.split("\n") if line.startswith("+") and not line.startswith("+++"))
+                    dels = sum(1 for line in diff_text.split("\n") if line.startswith("-") and not line.startswith("---"))
+
+                    result.append(ChangedFile(
+                        path=rel_path,
+                        status=status,
+                        additions=adds,
+                        deletions=dels,
+                        diff_content=diff_text if diff_text.strip() else None,
+                    ))
+                except Exception as e:
+                    logger.warning("Failed to get diff for %s: %s", rel_path, e)
+                    result.append(ChangedFile(path=rel_path, status="modified"))
+
+        return result
+
+    async def _collect_file_tree(
+        self, worktree_paths: dict[str, Path], changed_paths: list[str],
+    ) -> list[dict[str, Any]]:
+        """Collect git ls-tree from worktrees, excluding noisy dirs."""
+        SKIP_PREFIXES = (".tanstack/", "node_modules/", ".venv/", "__pycache__/", ".git/")
+        changed_set = set(changed_paths)
+        result: list[dict[str, Any]] = []
+
+        for repo_id, wt_path in worktree_paths.items():
+            # Resolve repo name from URL
+            repo_name = repo_id
+            workspace_meta = wt_path.parent.parent.parent / ".workspace.json"
+            if workspace_meta.exists():
+                import json as _json
+                meta = _json.loads(workspace_meta.read_text())
+                for r in meta.get("repos", []):
+                    if r.get("repo_id") == repo_id:
+                        url = r.get("repo_url", "")
+                        repo_name = url.rstrip("/").split("/")[-1].replace(".git", "") if url else repo_id
+                        break
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "ls-tree", "-r", "--name-only", "HEAD",
+                    cwd=str(wt_path),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                for line in stdout.decode("utf-8", errors="replace").strip().split("\n"):
+                    filepath = line.strip()
+                    if not filepath or any(filepath.startswith(p) for p in SKIP_PREFIXES):
+                        continue
+                    result.append({
+                        "path": filepath,
+                        "repo": repo_name,
+                        "changed": filepath in changed_set,
+                    })
+            except Exception as e:
+                logger.warning("Failed to get file tree from %s: %s", wt_path, e)
+
+        return result
+
+    @staticmethod
+    async def _git_file_exists_in_head(wt_path: Path, filepath: str) -> bool:
+        """Check if a file exists in the HEAD commit."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", "cat-file", "-e", f"HEAD:{filepath}",
+            cwd=str(wt_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        return proc.returncode == 0
 
     def _verify_result_to_dict(self, vr: VerifyResult) -> dict[str, Any]:
         data: dict[str, Any] = {

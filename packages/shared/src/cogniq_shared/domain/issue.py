@@ -5,6 +5,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from cogniq_shared.domain.enums import ArtifactType, EventType, IssueStatus, IssuePriority, MemberRole, RunStatus, Stage
+from cogniq_shared.domain.code_session import CodeSession
 
 
 def _utcnow() -> datetime:
@@ -75,6 +76,7 @@ class Issue(BaseModel):
     runs: list[Run] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
     events: list[Event] = Field(default_factory=list)
+    code_sessions: list[CodeSession] = Field(default_factory=list)
     summary: IssueSummary = Field(default_factory=IssueSummary)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)

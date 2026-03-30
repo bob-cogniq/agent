@@ -212,14 +212,6 @@ class BaseAgent(ABC):
             tomli_w.dump(cleaned, f)
 
 
-def _strip_none(obj: Any) -> Any:
-    """Recursively remove None values from dicts (TOML doesn't support None)."""
-    if isinstance(obj, dict):
-        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list):
-        return [_strip_none(i) for i in obj]
-    return obj
-
     @staticmethod
     def write_text(path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,3 +221,12 @@ def _strip_none(obj: Any) -> Any:
     async def run(self, issue_id: str, run_id: str) -> RunResult:
         """Subclass implements the actual agent logic."""
         ...
+
+
+def _strip_none(obj: Any) -> Any:
+    """Recursively remove None values from dicts (TOML doesn't support None)."""
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(i) for i in obj]
+    return obj

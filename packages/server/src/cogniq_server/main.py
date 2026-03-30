@@ -93,6 +93,7 @@ def _register_routers() -> None:
     from cogniq_server.api.runs import router as runs_router
     from cogniq_server.api.dashboard import router as dashboard_router
     from cogniq_server.api.webhooks import router as webhooks_router
+    from cogniq_server.api.code_sessions import router as code_sessions_router
 
     app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
     app.include_router(teams_router, prefix="/api", tags=["teams"])
@@ -105,6 +106,7 @@ def _register_routers() -> None:
     app.include_router(runs_router, prefix="/api", tags=["runs"])
     app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
     app.include_router(webhooks_router, prefix="/api/webhooks", tags=["webhooks"])
+    app.include_router(code_sessions_router, prefix="/api", tags=["code_sessions"])
 
 
 _register_routers()
