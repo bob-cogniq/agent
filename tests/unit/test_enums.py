@@ -1,4 +1,4 @@
-from cogniq.domain.enums import IssueStatus
+from cogniq_shared.domain.enums import IssueStatus
 
 
 class TestIssueStatus:

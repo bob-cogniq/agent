@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
-from cogniq.config import Settings
+from cogniq_shared.config import Settings
 
 
 @pytest.fixture(scope="session")

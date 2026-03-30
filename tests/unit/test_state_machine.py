@@ -1,7 +1,7 @@
 import pytest
 
-from cogniq.domain.enums import IssueStatus
-from cogniq.domain.state_machine import StateMachine
+from cogniq_shared.domain.enums import IssueStatus
+from cogniq_shared.domain.state_machine import StateMachine
 
 
 class TestStateMachine:

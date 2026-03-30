@@ -1,6 +1,6 @@
 import pytest
 
-from cogniq.agents.base import CostLimitExceeded, CostTracker
+from cogniq_worker.agents.base import CostLimitExceeded, CostTracker
 
 
 class TestCostTracker:
