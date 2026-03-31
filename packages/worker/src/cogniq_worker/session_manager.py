@@ -236,14 +236,82 @@ class IssueSessionManager:
             elif isinstance(message, StreamEvent):
                 pass
 
-        # Safety: if stream ended without ResultMessage, force status to completed
+        # Safety: if stream ended without ResultMessage, reconnect to get the response
         if not got_result:
-            logger.warning("Session %s: stream ended without ResultMessage — forcing completed", self.issue_id)
-            await self._repo.update_code_session(
-                self.issue_id, session_id,
-                {"status": "completed", "completed_at": datetime.now(timezone.utc)},
-                only_if_status="running",
-            )
+            logger.warning("Session %s: stream ended without ResultMessage — reconnecting", self.issue_id)
+            await self._reconnect_and_collect(client, session_id, turn_offset + turn)
+
+    async def _reconnect_and_collect(
+        self, client: ClaudeSDKClient, session_id: str, turn_offset: int, max_retries: int = 2,
+    ) -> None:
+        """Reconnect to a session that ended without ResultMessage and collect remaining output."""
+        for attempt in range(max_retries):
+            logger.info("Session %s: reconnect attempt %d/%d", self.issue_id, attempt + 1, max_retries)
+            got_result = False
+            turn = 0
+            try:
+                # Send empty follow-up to resume — SDK will reconnect to the same session
+                await client.query("")
+                async for message in self._safe_receive(client):
+                    if isinstance(message, AssistantMessage):
+                        turn += 1
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                await self._repo.add_code_message(
+                                    self.issue_id, session_id,
+                                    CodeMessage(turn=turn_offset + turn, role="assistant", content=block.text),
+                                )
+                            elif isinstance(block, ToolUseBlock):
+                                await self._repo.add_code_message(
+                                    self.issue_id, session_id,
+                                    CodeMessage(turn=turn_offset + turn, role="tool_use",
+                                                content=block.input, tool_name=block.name, tool_input=block.input),
+                                )
+                    elif isinstance(message, UserMessage):
+                        if isinstance(message.content, list):
+                            for block in message.content:
+                                if isinstance(block, ToolResultBlock):
+                                    await self._repo.add_code_message(
+                                        self.issue_id, session_id,
+                                        CodeMessage(turn=turn_offset + turn, role="tool_result",
+                                                    content=block.content, tool_name=block.tool_use_id),
+                                    )
+                    elif isinstance(message, ResultMessage):
+                        got_result = True
+                        if message.session_id:
+                            self._cli_session_id = message.session_id
+                        usage = message.usage or {}
+                        session = await self._repo.get_code_session(self.issue_id, session_id)
+                        if session:
+                            await self._repo.update_code_session(
+                                self.issue_id, session_id,
+                                {
+                                    "status": "failed" if message.is_error else "completed",
+                                    "cli_session_id": self._cli_session_id,
+                                    "total_turns": session.total_turns + message.num_turns,
+                                    "total_tokens": {
+                                        "input": session.total_tokens.get("input", 0) + usage.get("input_tokens", 0),
+                                        "output": session.total_tokens.get("output", 0) + usage.get("output_tokens", 0),
+                                    },
+                                    "total_cost_usd": session.total_cost_usd + (message.total_cost_usd or 0.0),
+                                    "completed_at": datetime.now(timezone.utc),
+                                    "interrupt_requested": False,
+                                    "error": (message.result or "")[:500] if message.is_error else None,
+                                },
+                                only_if_status="running",
+                            )
+                if got_result:
+                    return
+            except Exception as e:
+                logger.warning("Session %s: reconnect attempt %d failed: %s", self.issue_id, attempt + 1, e)
+
+        # All retries exhausted — force completed to avoid stuck session
+        logger.error("Session %s: all reconnect attempts failed — forcing completed", self.issue_id)
+        await self._repo.update_code_session(
+            self.issue_id, session_id,
+            {"status": "completed", "completed_at": datetime.now(timezone.utc), "error": "Stream ended without result after retries"},
+            only_if_status="running",
+        )
 
     async def _next_message(self, default_session_id: str, timeout: float) -> tuple[str, str]:
         """Get the next message from asyncio queue OR MongoDB queue.
