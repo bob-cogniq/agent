@@ -234,18 +234,8 @@ class IssueSessionManager:
                         only_if_status="running",
                     )
 
-                # Process next queued message (FIFO from DB queue)
-                next_msg = await self._repo.pop_queued_message(self.issue_id, session_id)
-                if next_msg:
-                    logger.info("Draining queued message for session %s", session_id)
-                    # Save user message to chat history
-                    user_msg = CodeMessage(
-                        turn=turn_offset + turn + 1, role="user", content=next_msg.prompt,
-                    )
-                    await self._repo.add_code_message(self.issue_id, session_id, user_msg)
-                    await self._repo.update_code_session(self.issue_id, session_id, {"status": "running"})
-                    # Feed into the session loop's asyncio.Queue for in-order processing
-                    await self._message_queue.put((session_id, next_msg.prompt))
+                # Queue drain is handled by _next_message in the _run_loop.
+                # Don't pop here — avoids injecting user messages mid-stream.
 
             elif isinstance(message, StreamEvent):
                 pass  # Fine-grained events — handled by incremental saves above
