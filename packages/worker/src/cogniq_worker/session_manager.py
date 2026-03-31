@@ -4,6 +4,13 @@ Each issue gets one ClaudeSDKClient that stays alive across multiple user
 messages. Follow-up prompts are fed into the same client (same conversation
 context), processed sequentially via an asyncio.Queue.
 
+Phase 3: Messages are saved to DB incrementally (each AssistantMessage/
+ToolUseBlock immediately) so SSE change-stream picks them up in near
+real-time.
+
+Phase 4: An interrupt watcher task monitors the session document for
+interrupt_requested=True and calls client.interrupt() when detected.
+
 SessionRegistry is a process-level singleton that maps issue_id → manager.
 """
 
@@ -34,14 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class IssueSessionManager:
-    """Manages a single ClaudeSDKClient for one issue.
-
-    Lifecycle:
-      1. start() — opens the client, runs the initial prompt
-      2. send_message() — enqueues follow-up prompts
-      3. Worker loop calls receive_message() from the asyncio.Queue in sequence
-      4. Session ends when queue is idle (timeout) or stop() is called
-    """
+    """Manages a single ClaudeSDKClient for one issue."""
 
     def __init__(
         self,
@@ -59,12 +59,12 @@ class IssueSessionManager:
 
         self._client: ClaudeSDKClient | None = None
         self._message_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-        # Queue contains (session_id, prompt) tuples
 
         self._active = False
         self._task: asyncio.Task | None = None
-        self._cli_session_id: str = ""  # updated after first ResultMessage
-        self._first_done = asyncio.Event()  # set after first _execute completes
+        self._interrupt_watcher: asyncio.Task | None = None
+        self._cli_session_id: str = ""
+        self._first_done = asyncio.Event()
         self._first_error: Exception | None = None
 
     # ── Public API ──
@@ -87,11 +87,9 @@ class IssueSessionManager:
         self._task.add_done_callback(self._on_done)
 
     async def send_message(self, session_id: str, prompt: str) -> None:
-        """Enqueue a follow-up prompt for sequential processing."""
         await self._message_queue.put((session_id, prompt))
 
     async def interrupt(self) -> None:
-        """Send interrupt signal to the running client."""
         if self._client:
             await self._client.interrupt()
 
@@ -100,18 +98,13 @@ class IssueSessionManager:
 
     def stop(self) -> None:
         self._active = False
+        if self._interrupt_watcher and not self._interrupt_watcher.done():
+            self._interrupt_watcher.cancel()
         if self._task and not self._task.done():
             self._task.cancel()
 
     async def wait_first_done(self, timeout: float = 600) -> None:
-        """Wait until the first execution completes (not the full session loop).
-
-        After this returns the session loop continues in the background,
-        ready to process queued follow-up messages without blocking the
-        Worker main loop.
-
-        Raises the first execution's error if it failed.
-        """
+        """Wait until the first execution completes (not the full session loop)."""
         await asyncio.wait_for(self._first_done.wait(), timeout=timeout)
         if self._first_error:
             raise self._first_error
@@ -120,11 +113,12 @@ class IssueSessionManager:
 
     def _on_done(self, task: asyncio.Task) -> None:
         self._active = False
+        if self._interrupt_watcher and not self._interrupt_watcher.done():
+            self._interrupt_watcher.cancel()
         if not task.cancelled() and task.exception():
             logger.error("Session %s failed: %s", self.issue_id, task.exception())
 
     async def _run_loop(self, first_session_id: str, first_prompt: str) -> None:
-        """Open client, execute first prompt, then drain queue until idle."""
         opts = ClaudeCodeOptions(
             permission_mode="bypassPermissions",
             max_turns=self._max_turns,
@@ -138,6 +132,12 @@ class IssueSessionManager:
             async with ClaudeSDKClient(options=opts) as client:
                 self._client = client
 
+                # Start interrupt watcher
+                self._interrupt_watcher = asyncio.create_task(
+                    self._watch_interrupt(first_session_id),
+                    name=f"interrupt-{self.issue_id}",
+                )
+
                 # First message
                 try:
                     await self._execute(client, first_session_id, first_prompt)
@@ -147,12 +147,12 @@ class IssueSessionManager:
                 finally:
                     self._first_done.set()
 
-                # Process queued messages (background — Worker loop unblocks)
+                # Process queued messages (background)
+                idle_timeout = getattr(settings, "session_idle_timeout_seconds", 300)
                 while self._active:
                     try:
                         session_id, prompt = await asyncio.wait_for(
-                            self._message_queue.get(),
-                            timeout=settings.session_idle_timeout_seconds if hasattr(settings, "session_idle_timeout_seconds") else 300,
+                            self._message_queue.get(), timeout=idle_timeout,
                         )
                         await self._execute(client, session_id, prompt)
                     except asyncio.TimeoutError:
@@ -164,17 +164,16 @@ class IssueSessionManager:
             logger.error("Session %s error: %s", self.issue_id, e, exc_info=True)
             self._first_error = self._first_error or e
         finally:
-            self._first_done.set()  # Ensure callers never hang
+            self._first_done.set()
+            if self._interrupt_watcher and not self._interrupt_watcher.done():
+                self._interrupt_watcher.cancel()
             self._client = None
             self._active = False
 
     async def _execute(self, client: ClaudeSDKClient, session_id: str, prompt: str) -> None:
-        """Execute one prompt against the persistent client."""
-        logger.info("Session %s executing prompt (session_id=%s)", self.issue_id, session_id)
+        """Execute one prompt. Saves messages incrementally for real-time SSE."""
+        logger.info("Session %s executing (session_id=%s)", self.issue_id, session_id)
         turn_offset = await self._get_turn_offset(session_id)
-
-        messages: list[dict] = []
-        files_changed: list[str] = []
         turn = 0
 
         await client.query(prompt)
@@ -184,31 +183,31 @@ class IssueSessionManager:
                 turn += 1
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        messages.append({"turn": turn_offset + turn, "role": "assistant", "content": block.text})
+                        # Phase 3: save immediately → SSE detects change
+                        msg = CodeMessage(
+                            turn=turn_offset + turn, role="assistant", content=block.text,
+                        )
+                        await self._repo.add_code_message(self.issue_id, session_id, msg)
                     elif isinstance(block, ToolUseBlock):
-                        messages.append({
-                            "turn": turn_offset + turn, "role": "tool_use",
-                            "content": block.input, "tool_name": block.name, "tool_input": block.input,
-                        })
-                        if block.name in ("Write", "Edit"):
-                            path = block.input.get("file_path", "")
-                            if path and path not in files_changed:
-                                files_changed.append(path)
+                        msg = CodeMessage(
+                            turn=turn_offset + turn, role="tool_use",
+                            content=block.input, tool_name=block.name, tool_input=block.input,
+                        )
+                        await self._repo.add_code_message(self.issue_id, session_id, msg)
 
             elif isinstance(message, UserMessage):
                 content = message.content
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, ToolResultBlock):
-                            messages.append({
-                                "turn": turn_offset + turn, "role": "tool_result",
-                                "content": block.content, "tool_name": block.tool_use_id,
-                            })
-                else:
-                    messages.append({"turn": turn_offset + turn, "role": "user", "content": str(content)})
+                            msg = CodeMessage(
+                                turn=turn_offset + turn, role="tool_result",
+                                content=block.content, tool_name=block.tool_use_id,
+                            )
+                            await self._repo.add_code_message(self.issue_id, session_id, msg)
+                # Don't save user-typed prompts here (already saved by API)
 
             elif isinstance(message, ResultMessage):
-                # Save cli_session_id for future resumes
                 if message.session_id:
                     self._cli_session_id = message.session_id
 
@@ -216,52 +215,66 @@ class IssueSessionManager:
                 session = await self._repo.get_code_session(self.issue_id, session_id)
                 if session:
                     new_turns = session.total_turns + message.num_turns
-                    new_tokens = {
-                        "input": session.total_tokens.get("input", 0) + usage.get("input_tokens", 0),
-                        "output": session.total_tokens.get("output", 0) + usage.get("output_tokens", 0),
-                    }
-                    new_cost = session.total_cost_usd + (message.total_cost_usd or 0.0)
                     new_status = "failed" if message.is_error else "completed"
-
-                    # Persist all new messages
-                    for m in messages:
-                        await self._repo.add_code_message(self.issue_id, session_id, CodeMessage(**m))
-
                     await self._repo.update_code_session(
                         self.issue_id, session_id,
                         {
                             "status": new_status,
                             "cli_session_id": self._cli_session_id,
                             "total_turns": new_turns,
-                            "total_tokens": new_tokens,
-                            "total_cost_usd": new_cost,
+                            "total_tokens": {
+                                "input": session.total_tokens.get("input", 0) + usage.get("input_tokens", 0),
+                                "output": session.total_tokens.get("output", 0) + usage.get("output_tokens", 0),
+                            },
+                            "total_cost_usd": session.total_cost_usd + (message.total_cost_usd or 0.0),
                             "completed_at": datetime.now(timezone.utc),
+                            "interrupt_requested": False,
                             "error": (message.result or "")[:500] if message.is_error else None,
                         },
                         only_if_status="running",
                     )
 
-                # Process next queued message if any
+                # Process next queued message (from DB queue)
                 next_msg = await self._repo.pop_queued_message(self.issue_id, session_id)
                 if next_msg:
                     logger.info("Auto-processing queued message for session %s", session_id)
                     await self._message_queue.put((session_id, next_msg.prompt))
-                    # Mark session running again for the queued message
                     user_msg = CodeMessage(
-                        turn=turn_offset + turn + 1,
-                        role="user",
-                        content=next_msg.prompt,
+                        turn=turn_offset + turn + 1, role="user", content=next_msg.prompt,
                     )
                     await self._repo.add_code_message(self.issue_id, session_id, user_msg)
                     await self._repo.update_code_session(self.issue_id, session_id, {"status": "running"})
 
             elif isinstance(message, StreamEvent):
-                # Future: relay to SSE broadcaster for text-chunk streaming
-                pass
+                pass  # Fine-grained events — handled by incremental saves above
+
+    # ── Phase 4: Interrupt watcher ──
+
+    async def _watch_interrupt(self, default_session_id: str) -> None:
+        """Watch MongoDB for interrupt_requested flag via polling.
+
+        Polls every 2 seconds — much simpler than a dedicated change stream
+        and sufficient for interrupt responsiveness.
+        """
+        try:
+            while self._active:
+                await asyncio.sleep(2)
+                session = await self._repo.get_code_session(self.issue_id, default_session_id)
+                if session and session.interrupt_requested:
+                    logger.info("Interrupt detected for session %s — interrupting client", default_session_id)
+                    await self._repo.clear_interrupt(self.issue_id, default_session_id)
+                    if self._client:
+                        await self._client.interrupt()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Interrupt watcher error: %s", e)
+
+    # ── Helpers ──
 
     @staticmethod
     async def _safe_receive(client: ClaudeSDKClient):
-        """Wrap receive_response to skip unknown message types (e.g. rate_limit_event)."""
+        """Wrap receive_response to skip unknown message types."""
         it = client.receive_response()
         while True:
             try:
@@ -274,16 +287,12 @@ class IssueSessionManager:
                 continue
 
     async def _get_turn_offset(self, session_id: str) -> int:
-        """Return current total_turns so new messages have correct turn numbers."""
         session = await self._repo.get_code_session(self.issue_id, session_id)
         return session.total_turns if session else 0
 
 
 class SessionRegistry:
-    """Process-level registry of active IssueSessionManagers.
-
-    One instance per Worker process. Maps issue_id → IssueSessionManager.
-    """
+    """Process-level registry of active IssueSessionManagers."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, IssueSessionManager] = {}
@@ -314,7 +323,6 @@ class SessionRegistry:
         task_queue: TaskQueueRepository,
         max_turns: int = 50,
     ) -> IssueSessionManager:
-        """Create a new IssueSessionManager and register it."""
         mgr = IssueSessionManager(
             issue_id=issue_id,
             workspace_root=workspace_root,

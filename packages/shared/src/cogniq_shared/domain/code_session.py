@@ -62,5 +62,6 @@ class CodeSession(BaseModel):
     changed_files: list[ChangedFile] = Field(default_factory=list)
     file_tree: list[dict[str, Any]] = Field(default_factory=list)  # [{path, repo, changed}]
     error: str | None = None
+    interrupt_requested: bool = False
     started_at: datetime = Field(default_factory=_utcnow)
     completed_at: datetime | None = None

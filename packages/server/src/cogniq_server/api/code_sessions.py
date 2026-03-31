@@ -168,6 +168,32 @@ async def continue_code_session(
     return {"status": "queued", "taskId": task_id}
 
 
+@router.post("/issues/{issue_id}/code-sessions/{session_id}/interrupt")
+async def interrupt_code_session(
+    issue_id: str,
+    session_id: str,
+    user: User = Depends(get_current_user),
+    repo: IssueRepository = Depends(get_issue_repository),
+):
+    """Request interruption of a running Claude Code session.
+
+    Sets interrupt_requested=True on the session. The Worker detects this
+    via MongoDB change stream and calls client.interrupt() + drain.
+    """
+    session = await repo.get_code_session(issue_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Code session not found")
+    if session.status != "running":
+        raise HTTPException(status_code=409, detail="Session is not running")
+
+    updated = await repo.request_interrupt(issue_id, session_id)
+    if not updated:
+        raise HTTPException(status_code=409, detail="Failed to set interrupt flag")
+
+    logger.info("Interrupt requested for session %s", session_id)
+    return {"status": "interrupt_requested"}
+
+
 async def _auth_sse(token: str = Query(...), db: AsyncIOMotorDatabase = Depends(get_db)) -> User:
     """Authenticate SSE connections via ?token= query param (EventSource can't set headers)."""
     try:

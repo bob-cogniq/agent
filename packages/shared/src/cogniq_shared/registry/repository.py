@@ -227,6 +227,29 @@ class IssueRepository:
         )
         return QueuedMessage.model_validate(msg)
 
+    async def request_interrupt(self, issue_id: str, session_id: str) -> bool:
+        """Set interrupt_requested=True on a running session. Returns True if updated."""
+        result = await self._col.update_one(
+            {
+                "_id": issue_id,
+                "code_sessions": {"$elemMatch": {"session_id": session_id, "status": "running"}},
+            },
+            {
+                "$set": {
+                    "code_sessions.$.interrupt_requested": True,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            },
+        )
+        return result.modified_count > 0
+
+    async def clear_interrupt(self, issue_id: str, session_id: str) -> None:
+        """Clear interrupt flag after processing."""
+        await self._col.update_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {"$set": {"code_sessions.$.interrupt_requested": False}},
+        )
+
     async def list_code_sessions(self, issue_id: str) -> list[CodeSession]:
         """Return sessions without messages (lightweight list)."""
         doc = await self._col.find_one({"_id": issue_id}, {"code_sessions": 1})
