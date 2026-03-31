@@ -147,13 +147,14 @@ class IssueSessionManager:
                 finally:
                     self._first_done.set()
 
-                # Process queued messages (background)
+                # Process queued messages (background — Worker loop unblocks)
                 idle_timeout = getattr(settings, "session_idle_timeout_seconds", 300)
                 while self._active:
                     try:
                         session_id, prompt = await asyncio.wait_for(
                             self._message_queue.get(), timeout=idle_timeout,
                         )
+                        logger.info("Session %s processing queued message", self.issue_id)
                         await self._execute(client, session_id, prompt)
                     except asyncio.TimeoutError:
                         logger.info("Session %s idle timeout — closing", self.issue_id)
