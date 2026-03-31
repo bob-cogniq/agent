@@ -210,94 +210,43 @@ async def _handle_code_chat(
     if not workspace:
         return TaskResult(status="failed", error="Workspace not found")
 
-    # Use ClaudeSDKClient (persistent) — handles rate limits internally,
-    # unlike query() which terminates on rate_limit_event.
-    from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKClient
-    from claude_code_sdk._errors import MessageParseError
-    from claude_code_sdk.types import (
-        AssistantMessage, ResultMessage, UserMessage, StreamEvent,
-        TextBlock, ToolUseBlock, ToolResultBlock,
-    )
+    # Use CLI subprocess — it handles rate limits internally (SDK doesn't).
+    from cogniq_worker.agents.claude_code import ClaudeCodeRunner
+    from cogniq_worker.agents.base import CostTracker
 
-    opts = ClaudeCodeOptions(
-        permission_mode="bypassPermissions",
-        max_turns=settings.build_max_turns,
-        cwd=str(workspace.root_path),
-    )
+    cost_tracker = CostTracker(max_usd=settings.build_max_cost_usd)
+    runner = ClaudeCodeRunner(cost_tracker=cost_tracker, max_turns=settings.build_max_turns)
+
     if chat.cli_session_id:
-        opts.resume = chat.cli_session_id
+        code_result = await runner.resume(
+            workspace_root=workspace.root_path,
+            cli_session_id=chat.cli_session_id,
+            prompt=prompt,
+        )
+    else:
+        code_result = await runner.run(
+            workspace_root=workspace.root_path,
+            prompt=prompt,
+        )
 
-    new_cli_session_id = chat.cli_session_id or ""
-    turn = chat.total_turns
-    input_tokens = 0
-    output_tokens = 0
-    cost_usd = 0.0
-    num_turns = 0
-    is_error = False
-
-    try:
-        async with ClaudeSDKClient(options=opts) as client:
-            await client.query(prompt)
-
-            # Iterate with error handling for unknown message types
-            it = client.receive_response()
-            while True:
-                try:
-                    message = await it.__anext__()
-                except StopAsyncIteration:
-                    break
-                except MessageParseError as e:
-                    logger.warning("Skipping unknown message type: %s", e)
-                    continue
-
-                if isinstance(message, AssistantMessage):
-                    turn += 1
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            await chat_repo.add_message(chat_id, CodeMessage(
-                                turn=turn, role="assistant", content=block.text,
-                            ))
-                        elif isinstance(block, ToolUseBlock):
-                            await chat_repo.add_message(chat_id, CodeMessage(
-                                turn=turn, role="tool_use",
-                                content=block.input, tool_name=block.name, tool_input=block.input,
-                            ))
-                elif isinstance(message, UserMessage):
-                    if isinstance(message.content, list):
-                        for block in message.content:
-                            if isinstance(block, ToolResultBlock):
-                                await chat_repo.add_message(chat_id, CodeMessage(
-                                    turn=turn, role="tool_result",
-                                    content=block.content, tool_name=block.tool_use_id,
-                                ))
-                elif isinstance(message, ResultMessage):
-                    if message.session_id:
-                        new_cli_session_id = message.session_id
-                    num_turns = message.num_turns
-                    is_error = message.is_error
-                    usage = message.usage or {}
-                    input_tokens = usage.get("input_tokens", 0)
-                    output_tokens = usage.get("output_tokens", 0)
-                    cost_usd = message.total_cost_usd or 0.0
-                elif isinstance(message, StreamEvent):
-                    if not new_cli_session_id and message.session_id:
-                        new_cli_session_id = message.session_id
-
-    except Exception as e:
-        logger.error("Code chat execution error: %s", e, exc_info=True)
-        is_error = True
+    # Save messages — skip echoed user text prompts
+    for msg_data in code_result.messages:
+        role = msg_data.get("role", "")
+        if role == "user" and not msg_data.get("tool_name"):
+            continue
+        await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
 
     # Update chat
-    new_status = "failed" if is_error else "completed"
+    new_status = "completed" if code_result.success else "failed"
     await chat_repo.update(chat_id, {
         "status": new_status,
-        "cli_session_id": new_cli_session_id,
-        "total_turns": turn,
+        "cli_session_id": code_result.cli_session_id or chat.cli_session_id,
+        "total_turns": chat.total_turns + code_result.turns_used,
         "total_tokens": {
-            "input": chat.total_tokens.get("input", 0) + input_tokens,
-            "output": chat.total_tokens.get("output", 0) + output_tokens,
+            "input": chat.total_tokens.get("input", 0) + code_result.total_input_tokens,
+            "output": chat.total_tokens.get("output", 0) + code_result.total_output_tokens,
         },
-        "total_cost_usd": chat.total_cost_usd + cost_usd,
+        "total_cost_usd": chat.total_cost_usd + code_result.total_cost_usd,
     }, only_if_status="running")
 
     return TaskResult(status="success")
