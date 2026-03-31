@@ -16,6 +16,7 @@ from cogniq_shared.registry.repository import IssueRepository
 from cogniq_shared.taskqueue.models import TaskResult
 from cogniq_shared.taskqueue.repository import TaskQueueRepository
 from cogniq_worker.heartbeat import heartbeat_loop
+from cogniq_worker.session_manager import SessionRegistry
 from cogniq_worker.task_runner import run_agent
 from cogniq_worker.workspace import WorkspaceManager
 
@@ -37,6 +38,9 @@ async def main() -> None:
     repo = IssueRepository(db)
     task_queue = TaskQueueRepository(db)
     workspace_mgr = WorkspaceManager(Path(settings.work_base_dir))
+
+    # Session registry: maintains persistent ClaudeSDKClient per issue
+    session_registry = SessionRegistry()
 
     running = True
 
@@ -65,7 +69,7 @@ async def main() -> None:
 
         try:
             await task_queue.start(task.id)
-            result = await run_agent(task, repo, workspace_mgr, task_queue)
+            result = await run_agent(task, repo, workspace_mgr, task_queue, session_registry)
             await task_queue.complete(task.id, result)
             logger.info("Task %s completed: %s", task.id, result.status)
         except Exception as e:

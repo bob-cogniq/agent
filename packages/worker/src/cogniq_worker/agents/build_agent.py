@@ -6,7 +6,7 @@ from typing import Any
 
 from cogniq_worker.agents.base import BaseAgent, RunResult
 from cogniq_worker.agents.claude_client import ClaudeClient
-from cogniq_worker.agents.claude_code import ClaudeCodeRunner
+from cogniq_worker.agents.claude_sdk import ClaudeSDKRunner, ClaudeCodeResult
 from cogniq_worker.workspace import ProjectWorkspace, WorkspaceManager
 from cogniq_shared.config import settings
 from cogniq_shared.domain.enums import ArtifactType, EventType, Stage
@@ -41,7 +41,7 @@ class BuildAgent(BaseAgent):
         self._claude = ClaudeClient(
             cost_tracker=self._cost_tracker,
         )
-        self._claude_code = ClaudeCodeRunner(
+        self._claude_code = ClaudeSDKRunner(
             cost_tracker=self._cost_tracker,
             max_turns=settings.build_max_turns,
         )
