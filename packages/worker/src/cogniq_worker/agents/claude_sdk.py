@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from claude_code_sdk import query, ClaudeCodeOptions, ClaudeSDKClient
+from claude_code_sdk._errors import MessageParseError
 from claude_code_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -109,7 +110,7 @@ class ClaudeSDKRunner:
         result = ClaudeCodeResult()
         turn = 0
 
-        async for message in query(prompt=prompt, options=opts):
+        async for message in self._safe_query(prompt, opts):
             if on_event:
                 await on_event(message)
             turn = self._process_message(message, result, turn)
@@ -120,13 +121,27 @@ class ClaudeSDKRunner:
         result = ClaudeCodeResult()
         turn = 0
         try:
-            async for message in query(prompt=prompt, options=opts):
+            async for message in self._safe_query(prompt, opts):
                 turn = self._process_message(message, result, turn)
         except Exception as e:
             logger.error("Claude Code SDK error: %s", e, exc_info=True)
             result.success = False
             result.error = str(e)
         return result
+
+    @staticmethod
+    async def _safe_query(prompt: str, opts: ClaudeCodeOptions):
+        """Wrap query() to skip unknown message types (e.g. rate_limit_event)."""
+        it = query(prompt=prompt, options=opts).__aiter__()
+        while True:
+            try:
+                message = await it.__anext__()
+                yield message
+            except StopAsyncIteration:
+                break
+            except MessageParseError as e:
+                logger.debug("Skipping unknown message type: %s", e)
+                continue
 
     def _process_message(self, message: Any, result: ClaudeCodeResult, turn: int) -> int:
         """Update result from a single SDK message. Returns updated turn counter."""

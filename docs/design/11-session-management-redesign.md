@@ -401,12 +401,12 @@ while running:
 - [x] SSE 엔드포인트 (MongoDB Change Stream 기반) — 세션 상태 변경 알림
 - [x] Continue API: 실행 중이면 큐잉, 동시 요청 방지
 
-### Phase 2 (다음): SDK 전환
-- [ ] `claude_agent_sdk` 패키지 설치 및 API 검증
-- [ ] `ClaudeCodeRunner` → `ClaudeSDKClient` 래퍼 교체
-- [ ] `IssueSessionManager` 구현
-- [ ] Worker: `SessionRegistry` 도입
-- [ ] SSE Broadcaster를 인메모리 Pub/Sub으로 교체 (Change Stream 의존 제거)
+### Phase 2 (완료): SDK 전환
+- [x] `claude-code-sdk` 패키지 설치 및 API 검증
+- [x] `ClaudeCodeRunner` → `ClaudeSDKRunner` (SDK 기반) 교체
+- [x] `IssueSessionManager` 구현 (영구 세션 + asyncio.Queue)
+- [x] Worker: `SessionRegistry` 도입 + `wait_first_done()` 비블록 패턴
+- [ ] SSE Broadcaster를 인메모리 Pub/Sub으로 교체 (Phase 3에서 Redis와 함께)
 
 ### Phase 3 (개선): 실시간 스트리밍
 - [ ] `include_partial_messages=True` 활성화

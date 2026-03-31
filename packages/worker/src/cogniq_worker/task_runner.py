@@ -99,13 +99,13 @@ async def _handle_continue(
             cli_session_id=cli_session_id or None,
             project_id=issue.project_id,
         )
-        # Wait for the first execution to complete
-        if mgr._task:
-            try:
-                await mgr._task
-            except Exception as e:
-                logger.error("Session task failed: %s", e)
-                return TaskResult(status="failed", error=str(e)[:500])
+        # Wait only for the first execution — session loop stays alive
+        # in the background for follow-up messages
+        try:
+            await mgr.wait_first_done(timeout=600)
+        except Exception as e:
+            logger.error("Session first execution failed: %s", e)
+            return TaskResult(status="failed", error=str(e)[:500])
     else:
         # No registry — use SDK runner directly (stateless resume)
         from cogniq_worker.agents.claude_sdk import ClaudeSDKRunner

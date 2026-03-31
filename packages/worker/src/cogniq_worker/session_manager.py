@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKClient
+from claude_code_sdk._errors import MessageParseError
 from claude_code_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -63,6 +64,8 @@ class IssueSessionManager:
         self._active = False
         self._task: asyncio.Task | None = None
         self._cli_session_id: str = ""  # updated after first ResultMessage
+        self._first_done = asyncio.Event()  # set after first _execute completes
+        self._first_error: Exception | None = None
 
     # ── Public API ──
 
@@ -100,6 +103,19 @@ class IssueSessionManager:
         if self._task and not self._task.done():
             self._task.cancel()
 
+    async def wait_first_done(self, timeout: float = 600) -> None:
+        """Wait until the first execution completes (not the full session loop).
+
+        After this returns the session loop continues in the background,
+        ready to process queued follow-up messages without blocking the
+        Worker main loop.
+
+        Raises the first execution's error if it failed.
+        """
+        await asyncio.wait_for(self._first_done.wait(), timeout=timeout)
+        if self._first_error:
+            raise self._first_error
+
     # ── Internal loop ──
 
     def _on_done(self, task: asyncio.Task) -> None:
@@ -123,9 +139,15 @@ class IssueSessionManager:
                 self._client = client
 
                 # First message
-                await self._execute(client, first_session_id, first_prompt)
+                try:
+                    await self._execute(client, first_session_id, first_prompt)
+                except Exception as e:
+                    self._first_error = e
+                    raise
+                finally:
+                    self._first_done.set()
 
-                # Process queued messages
+                # Process queued messages (background — Worker loop unblocks)
                 while self._active:
                     try:
                         session_id, prompt = await asyncio.wait_for(
@@ -140,7 +162,9 @@ class IssueSessionManager:
             logger.info("Session %s cancelled", self.issue_id)
         except Exception as e:
             logger.error("Session %s error: %s", self.issue_id, e, exc_info=True)
+            self._first_error = self._first_error or e
         finally:
+            self._first_done.set()  # Ensure callers never hang
             self._client = None
             self._active = False
 
@@ -155,7 +179,7 @@ class IssueSessionManager:
 
         await client.query(prompt)
 
-        async for message in client.receive_response():
+        async for message in self._safe_receive(client):
             if isinstance(message, AssistantMessage):
                 turn += 1
                 for block in message.content:
@@ -234,6 +258,20 @@ class IssueSessionManager:
             elif isinstance(message, StreamEvent):
                 # Future: relay to SSE broadcaster for text-chunk streaming
                 pass
+
+    @staticmethod
+    async def _safe_receive(client: ClaudeSDKClient):
+        """Wrap receive_response to skip unknown message types (e.g. rate_limit_event)."""
+        it = client.receive_response()
+        while True:
+            try:
+                message = await it.__anext__()
+                yield message
+            except StopAsyncIteration:
+                break
+            except MessageParseError as e:
+                logger.debug("Skipping unknown message type: %s", e)
+                continue
 
     async def _get_turn_offset(self, session_id: str) -> int:
         """Return current total_turns so new messages have correct turn numbers."""
