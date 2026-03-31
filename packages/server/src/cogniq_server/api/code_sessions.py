@@ -1,17 +1,24 @@
 """Code Sessions API — view Claude Code execution history and continue sessions."""
 
+import asyncio
+import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+import jwt as pyjwt
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from cogniq_server.auth.dependencies import get_current_user
+from cogniq_server.auth.jwt import decode_token
 from cogniq_server.auth.models import User
 from cogniq_server.dependencies import get_db, get_issue_repository, get_task_queue
-from cogniq_shared.domain.code_session import CodeSession, CodeMessage
+from cogniq_shared.config import settings
+from cogniq_shared.domain.code_session import CodeSession, CodeMessage, QueuedMessage
 from cogniq_shared.registry.repository import IssueRepository
 from cogniq_shared.taskqueue.repository import TaskQueueRepository
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,6 +47,7 @@ def _session_summary(s: CodeSession) -> dict:
             {"path": f.path, "status": f.status, "additions": f.additions, "deletions": f.deletions}
             for f in s.changed_files
         ],
+        "queueLength": len(s.message_queue),
         "error": s.error,
         "startedAt": s.started_at.isoformat() if s.started_at else None,
         "completedAt": s.completed_at.isoformat() if s.completed_at else None,
@@ -104,22 +112,33 @@ async def continue_code_session(
     repo: IssueRepository = Depends(get_issue_repository),
     task_queue: TaskQueueRepository = Depends(get_task_queue),
 ):
-    """Continue an existing Claude Code session with a follow-up prompt."""
-    # Validate session exists and has CLI session ID
+    """Continue an existing Claude Code session with a follow-up prompt.
+
+    If the session is already running, the message is queued and will be
+    processed automatically when the current run completes.
+    """
     session = await repo.get_code_session(issue_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Code session not found")
     if not session.cli_session_id:
         raise HTTPException(status_code=400, detail="Session cannot be continued (no CLI session ID)")
+
+    # If session is running → queue the message (Claude Desktop style)
     if session.status == "running":
-        raise HTTPException(status_code=409, detail="Session is already running")
+        queued = QueuedMessage(prompt=body.prompt)
+        await repo.enqueue_message(issue_id, session_id, queued)
+        logger.info("Message queued for running session %s (queue_length=%d)", session_id, len(session.message_queue) + 1)
+        return {"status": "queued", "queueLength": len(session.message_queue) + 1}
 
     # Atomically set session to running — prevents concurrent continues
     changed = await repo.update_code_session(
         issue_id, session_id, {"status": "running"}, only_if_status=session.status,
     )
     if not changed:
-        raise HTTPException(status_code=409, detail="Session is already running (concurrent request)")
+        # Race: another request beat us — queue instead
+        queued = QueuedMessage(prompt=body.prompt)
+        await repo.enqueue_message(issue_id, session_id, queued)
+        return {"status": "queued", "queueLength": 1}
 
     # Get issue for project_id
     issue = await repo.get(issue_id)
@@ -147,6 +166,70 @@ async def continue_code_session(
     )
 
     return {"status": "queued", "taskId": task_id}
+
+
+async def _auth_sse(token: str = Query(...), db: AsyncIOMotorDatabase = Depends(get_db)) -> User:
+    """Authenticate SSE connections via ?token= query param (EventSource can't set headers)."""
+    try:
+        payload = decode_token(token)
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user_doc = await db["users"].find_one({"_id": user_id})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+    return User.model_validate(user_doc)
+
+
+@router.get("/issues/{issue_id}/stream")
+async def stream_issue_events(
+    issue_id: str,
+    user: User = Depends(_auth_sse),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """SSE stream — pushes real-time notifications when code sessions update.
+
+    Clients connect once and receive events whenever the issue document changes.
+    Each event signals the client to refetch session data.
+
+    Uses ?token= query param because EventSource cannot send Authorization headers.
+    """
+    async def event_generator():
+        # Initial connection event
+        yield f"data: {json.dumps({'type': 'connected', 'issueId': issue_id})}\n\n"
+
+        pipeline = [
+            {"$match": {
+                "documentKey._id": issue_id,
+                "operationType": {"$in": ["update", "replace"]},
+            }}
+        ]
+        try:
+            async with db["issues"].watch(pipeline) as stream:
+                async for change in stream:
+                    updated = change.get("updateDescription", {}).get("updatedFields", {})
+                    # Emit event when code_sessions or summary fields change
+                    if any(k.startswith("code_sessions") or k.startswith("summary") for k in updated):
+                        payload: dict[str, Any] = {"type": "session_update", "issueId": issue_id}
+                        yield f"data: {json.dumps(payload)}\n\n"
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Tell nginx not to buffer SSE
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/issues/{issue_id}/code-sessions/{session_id}/files")

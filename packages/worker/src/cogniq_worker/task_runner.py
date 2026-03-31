@@ -6,15 +6,21 @@ from cogniq_worker.agents.plan_agent import PlanAgent
 from cogniq_worker.agents.claude_code import ClaudeCodeRunner
 from cogniq_worker.agents.base import CostTracker
 from cogniq_shared.config import settings
-from cogniq_shared.domain.code_session import CodeMessage, ChangedFile
+from cogniq_shared.domain.code_session import CodeMessage, ChangedFile, QueuedMessage
 from cogniq_shared.registry.repository import IssueRepository
 from cogniq_shared.taskqueue.models import TaskDocument, TaskResult
+from cogniq_shared.taskqueue.repository import TaskQueueRepository
 from cogniq_worker.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
 
-async def run_agent(task: TaskDocument, repo: IssueRepository, workspace_mgr: WorkspaceManager) -> TaskResult:
+async def run_agent(
+    task: TaskDocument,
+    repo: IssueRepository,
+    workspace_mgr: WorkspaceManager,
+    task_queue: TaskQueueRepository | None = None,
+) -> TaskResult:
     """Map task stage to agent, execute, return result."""
     logger.info("Running agent: issue=%s stage=%s", task.issue_id, task.stage)
 
@@ -25,7 +31,7 @@ async def run_agent(task: TaskDocument, repo: IssueRepository, workspace_mgr: Wo
         agent = BuildAgent(repo=repo, workspace_mgr=workspace_mgr)
         result = await agent.execute(task.issue_id)
     elif task.stage == "continue":
-        return await _handle_continue(task, repo, workspace_mgr)
+        return await _handle_continue(task, repo, workspace_mgr, task_queue)
     else:
         return TaskResult(status="failed", error=f"Unknown stage: {task.stage}")
 
@@ -39,7 +45,10 @@ async def run_agent(task: TaskDocument, repo: IssueRepository, workspace_mgr: Wo
 
 
 async def _handle_continue(
-    task: TaskDocument, repo: IssueRepository, workspace_mgr: WorkspaceManager,
+    task: TaskDocument,
+    repo: IssueRepository,
+    workspace_mgr: WorkspaceManager,
+    task_queue: TaskQueueRepository | None = None,
 ) -> TaskResult:
     """Continue an existing Claude Code session with a follow-up prompt."""
     config = task.config or {}
@@ -78,6 +87,9 @@ async def _handle_continue(
 
     # Update session aggregates
     session = await repo.get_code_session(task.issue_id, session_id)
+    new_turns = 0
+    new_cli_session_id = code_result.cli_session_id or cli_session_id
+
     if session:
         new_turns = session.total_turns + code_result.turns_used
         new_tokens = {
@@ -92,7 +104,7 @@ async def _handle_continue(
             "total_turns": new_turns,
             "total_tokens": new_tokens,
             "total_cost_usd": new_cost,
-            "cli_session_id": code_result.cli_session_id or cli_session_id,
+            "cli_session_id": new_cli_session_id,
             "completed_at": datetime.now(timezone.utc),
             "error": code_result.error[:500] if code_result.error else None,
         }
@@ -102,6 +114,32 @@ async def _handle_continue(
             logger.warning("Session %s was not in 'running' state — update may have been superseded", session_id)
     else:
         logger.warning("Session %s not found for issue %s — status update skipped", session_id, task.issue_id)
+
+    # Process next queued message if any (Claude Desktop style)
+    if task_queue:
+        next_msg = await repo.pop_queued_message(task.issue_id, session_id)
+        if next_msg:
+            logger.info("Processing queued message for session %s", session_id)
+            # Mark session as running again
+            await repo.update_code_session(task.issue_id, session_id, {"status": "running"})
+            # Save the user message
+            user_msg = CodeMessage(
+                turn=new_turns + 1,
+                role="user",
+                content=next_msg.prompt,
+            )
+            await repo.add_code_message(task.issue_id, session_id, user_msg)
+            # Enqueue as a new continue task
+            await task_queue.enqueue(
+                issue_id=task.issue_id,
+                project_id=task.project_id,
+                stage="continue",
+                config={
+                    "session_id": session_id,
+                    "cli_session_id": new_cli_session_id,
+                    "prompt": next_msg.prompt,
+                },
+            )
 
     status = "success" if code_result.success else "failed"
     return TaskResult(

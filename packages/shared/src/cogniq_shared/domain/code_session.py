@@ -38,6 +38,14 @@ class ChangedFile(BaseModel):
     diff_content: str | None = None  # unified diff text (truncated to 50KB)
 
 
+class QueuedMessage(BaseModel):
+    """A user message queued while the session is already running."""
+
+    message_id: str = Field(default_factory=_new_id)
+    prompt: str
+    queued_at: datetime = Field(default_factory=_utcnow)
+
+
 class CodeSession(BaseModel):
     """A complete Claude Code CLI execution session."""
 
@@ -47,6 +55,7 @@ class CodeSession(BaseModel):
     status: str = "running"  # "running" | "completed" | "failed"
     model: str = "sonnet"
     messages: list[CodeMessage] = Field(default_factory=list)
+    message_queue: list[QueuedMessage] = Field(default_factory=list)  # queued user prompts
     total_turns: int = 0
     total_tokens: dict[str, int] = Field(default_factory=lambda: {"input": 0, "output": 0})
     total_cost_usd: float = 0.0

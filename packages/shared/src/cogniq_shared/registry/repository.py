@@ -5,7 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from cogniq_shared.domain.enums import IssueStatus
 from cogniq_shared.domain.issue import Artifact, Event, Issue, IssueSummary, Run
-from cogniq_shared.domain.code_session import CodeMessage, CodeSession
+from cogniq_shared.domain.code_session import CodeMessage, CodeSession, QueuedMessage
 from cogniq_shared.domain.state_machine import StateMachine
 
 
@@ -195,6 +195,37 @@ class IssueRepository:
                 "$set": {"updated_at": datetime.now(timezone.utc)},
             },
         )
+
+    async def enqueue_message(self, issue_id: str, session_id: str, message: QueuedMessage) -> None:
+        """Append a message to the session's queue (for when session is running)."""
+        await self._col.update_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {
+                "$push": {"code_sessions.$.message_queue": message.model_dump()},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+
+    async def pop_queued_message(self, issue_id: str, session_id: str) -> QueuedMessage | None:
+        """Atomically pop the oldest queued message. Returns None if queue is empty."""
+        doc = await self._col.find_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {"code_sessions.$": 1},
+        )
+        if not doc or not doc.get("code_sessions"):
+            return None
+        queue = doc["code_sessions"][0].get("message_queue", [])
+        if not queue:
+            return None
+        msg = queue[0]
+        await self._col.update_one(
+            {"_id": issue_id, "code_sessions.session_id": session_id},
+            {
+                "$pull": {"code_sessions.$.message_queue": {"message_id": msg["message_id"]}},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return QueuedMessage.model_validate(msg)
 
     async def list_code_sessions(self, issue_id: str) -> list[CodeSession]:
         """Return sessions without messages (lightweight list)."""

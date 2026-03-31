@@ -65,7 +65,7 @@ async def main() -> None:
 
         try:
             await task_queue.start(task.id)
-            result = await run_agent(task, repo, workspace_mgr)
+            result = await run_agent(task, repo, workspace_mgr, task_queue)
             await task_queue.complete(task.id, result)
             logger.info("Task %s completed: %s", task.id, result.status)
         except Exception as e:
