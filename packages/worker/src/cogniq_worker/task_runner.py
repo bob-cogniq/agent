@@ -229,8 +229,10 @@ async def _handle_code_chat(
             prompt=prompt,
         )
 
-    # Save messages
+    # Save messages — skip user role (already saved above or by API)
     for msg_data in code_result.messages:
+        if msg_data.get("role") == "user":
+            continue
         await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
 
     # Update chat
