@@ -127,6 +127,34 @@ class ClaudeSDKRunner:
             logger.error("Claude Code SDK error: %s", e, exc_info=True)
             result.success = False
             result.error = str(e)
+
+        # If stream ended without ResultMessage (e.g., rate_limit_event),
+        # retry with --resume to collect the remaining response
+        if not result.cli_session_id and not result.success and not result.error:
+            # No result at all — stream was empty or broken
+            result.success = False
+            result.error = "Stream ended without result"
+        elif result.cli_session_id and not any(
+            m.get("role") == "assistant" and isinstance(m.get("content"), str)
+            for m in result.messages
+        ):
+            # Got a session ID but no final text response — retry with resume
+            logger.warning("No final response — retrying with --resume %s", result.cli_session_id)
+            import asyncio as _asyncio
+            await _asyncio.sleep(2)  # Wait for rate limit to clear
+            retry_opts = ClaudeCodeOptions(
+                permission_mode=opts.permission_mode,
+                max_turns=opts.max_turns,
+                cwd=opts.cwd,
+                include_partial_messages=opts.include_partial_messages,
+                resume=result.cli_session_id,
+            )
+            try:
+                async for message in self._safe_query("", retry_opts):
+                    turn = self._process_message(message, result, turn)
+            except Exception as e:
+                logger.warning("Retry failed: %s", e)
+
         return result
 
     @staticmethod
@@ -140,11 +168,21 @@ class ClaudeSDKRunner:
             except StopAsyncIteration:
                 break
             except MessageParseError as e:
-                logger.debug("Skipping unknown message type: %s", e)
+                logger.warning("Skipping unknown message type: %s", e)
                 continue
 
     def _process_message(self, message: Any, result: ClaudeCodeResult, turn: int) -> int:
         """Update result from a single SDK message. Returns updated turn counter."""
+        msg_type = type(message).__name__
+        if isinstance(message, AssistantMessage):
+            blocks = [type(b).__name__ for b in message.content]
+            logger.info("SDK message: %s blocks=%s", msg_type, blocks)
+        elif isinstance(message, UserMessage):
+            logger.info("SDK message: %s content_type=%s", msg_type, type(message.content).__name__)
+        elif isinstance(message, ResultMessage):
+            logger.info("SDK message: %s success=%s turns=%d", msg_type, not message.is_error, message.num_turns)
+        else:
+            pass  # StreamEvent/SystemMessage — skip logging to reduce noise
         if isinstance(message, AssistantMessage):
             turn += 1
             for block in message.content:
