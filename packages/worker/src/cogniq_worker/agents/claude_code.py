@@ -27,9 +27,10 @@ class ClaudeCodeResult:
 class ClaudeCodeRunner:
     """Wrapper for Claude Code CLI (subprocess execution)."""
 
-    def __init__(self, cost_tracker: CostTracker, max_turns: int = 50):
+    def __init__(self, cost_tracker: CostTracker, max_turns: int = 50, on_message=None):
         self._cost_tracker = cost_tracker
         self._max_turns = max_turns
+        self._on_message = on_message  # async callback(data: dict, result: ClaudeCodeResult)
 
     async def run(
         self,
@@ -84,7 +85,11 @@ class ClaudeCodeRunner:
         return await self._execute(cmd, workspace_root)
 
     async def _execute(self, cmd: list[str], cwd: Path) -> ClaudeCodeResult:
-        """Execute a Claude Code CLI command and parse the output."""
+        """Execute a Claude Code CLI command and parse the output.
+
+        Uses line-by-line streaming instead of communicate() so that
+        on_message callbacks can save messages to DB in real-time.
+        """
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -93,15 +98,36 @@ class ClaudeCodeRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await process.communicate()
-            output = stdout.decode("utf-8", errors="replace")
-            error = stderr.decode("utf-8", errors="replace")
+            result = ClaudeCodeResult()
+            turn = 0
 
+            # Stream stdout line by line
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+                try:
+                    data = json.loads(line_str)
+                    turn = self._process_line(data, result, turn)
+                    # Real-time callback for incremental DB saves
+                    if self._on_message:
+                        await self._on_message(data, result)
+                except json.JSONDecodeError:
+                    result.output += line_str + "\n"
+
+            # Wait for process to finish and capture stderr
+            await process.wait()
             if process.returncode != 0:
+                stderr_data = await process.stderr.read()
+                error = stderr_data.decode("utf-8", errors="replace")
                 logger.error("Claude Code failed (rc=%d): %s", process.returncode, error[:500])
-                return ClaudeCodeResult(success=False, error=error[:2000], output=output)
+                if not result.cli_session_id:
+                    return ClaudeCodeResult(success=False, error=error[:2000])
 
-            return self._parse_output(output)
+            return result
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
@@ -111,90 +137,72 @@ class ClaudeCodeRunner:
             logger.error("Claude Code execution error: %s", e, exc_info=True)
             return ClaudeCodeResult(success=False, error=str(e))
 
-    def _parse_output(self, raw_output: str) -> ClaudeCodeResult:
-        """Parse Claude Code stream-json output and collect messages for CodeSession."""
-        result = ClaudeCodeResult()
-        turn = 0
+    def _process_line(self, data: dict, result: ClaudeCodeResult, turn: int) -> int:
+        """Process a single JSON line from stream-json output. Returns updated turn."""
+        msg_type = data.get("type", "")
 
-        try:
-            lines = raw_output.strip().split("\n")
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    msg_type = data.get("type", "")
+        if msg_type == "result":
+            result.success = not data.get("is_error", False)
+            result.output = data.get("result", "")
+            result.model = data.get("model", "")
+            result.cli_session_id = data.get("session_id", "")
+            usage = data.get("usage", {})
+            if usage:
+                result.total_input_tokens = usage.get("input_tokens", 0)
+                result.total_output_tokens = usage.get("output_tokens", 0)
+                self._cost_tracker.add(
+                    result.total_input_tokens,
+                    result.total_output_tokens,
+                    result.model,
+                )
+            result.total_cost_usd = data.get("total_cost_usd", 0.0)
+            result.turns_used = data.get("num_turns", 0)
 
-                    if msg_type == "result":
-                        result.success = not data.get("is_error", False)
-                        result.output = data.get("result", "")
-                        result.model = data.get("model", "")
-                        result.cli_session_id = data.get("session_id", "")
-                        usage = data.get("usage", {})
-                        if usage:
-                            result.total_input_tokens = usage.get("input_tokens", 0)
-                            result.total_output_tokens = usage.get("output_tokens", 0)
-                            self._cost_tracker.add(
-                                result.total_input_tokens,
-                                result.total_output_tokens,
-                                result.model,
-                            )
-                        result.total_cost_usd = data.get("total_cost_usd", 0.0)
-                        result.turns_used = data.get("num_turns", 0)
+        elif msg_type == "assistant":
+            turn += 1
+            content = data.get("message", {}).get("content", [])
 
-                    elif msg_type == "assistant":
-                        turn += 1
-                        content = data.get("message", {}).get("content", [])
+            for block in (content if isinstance(content, list) else []):
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    result.messages.append({
+                        "turn": turn,
+                        "role": "tool_use",
+                        "content": block.get("input", {}),
+                        "tool_name": block.get("name", ""),
+                        "tool_input": block.get("input", {}),
+                    })
+                    if block.get("name") in ("Write", "Edit"):
+                        path = block.get("input", {}).get("file_path", "")
+                        if path and path not in result.files_changed:
+                            result.files_changed.append(path)
 
-                        for block in (content if isinstance(content, list) else []):
-                            if isinstance(block, dict) and block.get("type") == "tool_use":
-                                result.messages.append({
-                                    "turn": turn,
-                                    "role": "tool_use",
-                                    "content": block.get("input", {}),
-                                    "tool_name": block.get("name", ""),
-                                    "tool_input": block.get("input", {}),
-                                })
-                                if block.get("name") in ("Write", "Edit"):
-                                    path = block.get("input", {}).get("file_path", "")
-                                    if path and path not in result.files_changed:
-                                        result.files_changed.append(path)
+            text_parts = []
+            for block in (content if isinstance(content, list) else []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            if text_parts:
+                result.messages.append({
+                    "turn": turn,
+                    "role": "assistant",
+                    "content": "\n".join(text_parts),
+                })
 
-                        text_parts = []
-                        for block in (content if isinstance(content, list) else []):
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text_parts.append(block.get("text", ""))
-                        if text_parts:
-                            result.messages.append({
-                                "turn": turn,
-                                "role": "assistant",
-                                "content": "\n".join(text_parts),
-                            })
+        elif msg_type == "user":
+            content = data.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        result.messages.append({
+                            "turn": turn,
+                            "role": "tool_result",
+                            "content": block.get("content", ""),
+                            "tool_name": block.get("tool_use_id", ""),
+                        })
+            else:
+                result.messages.append({
+                    "turn": turn,
+                    "role": "user",
+                    "content": str(content),
+                })
 
-                    elif msg_type == "user":
-                        content = data.get("message", {}).get("content", "")
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "tool_result":
-                                    result.messages.append({
-                                        "turn": turn,
-                                        "role": "tool_result",
-                                        "content": block.get("content", ""),
-                                        "tool_name": block.get("tool_use_id", ""),
-                                    })
-                        else:
-                            result.messages.append({
-                                "turn": turn,
-                                "role": "user",
-                                "content": str(content),
-                            })
-
-                except json.JSONDecodeError:
-                    result.output += line + "\n"
-
-        except Exception as e:
-            logger.warning("Failed to parse Claude Code output: %s", e)
-            result.output = raw_output
-
-        return result
+        return turn

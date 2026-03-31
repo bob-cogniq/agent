@@ -210,12 +210,30 @@ async def _handle_code_chat(
     if not workspace:
         return TaskResult(status="failed", error="Workspace not found")
 
-    # Use CLI subprocess — it handles rate limits internally (SDK doesn't).
+    # Use CLI subprocess with real-time streaming callback.
+    # CLI handles rate limits internally (SDK doesn't).
     from cogniq_worker.agents.claude_code import ClaudeCodeRunner
     from cogniq_worker.agents.base import CostTracker
 
+    saved_turns = set()  # Track which messages were already saved by callback
+
+    async def on_message(data: dict, result) -> None:
+        """Save messages to DB in real-time as CLI streams them."""
+        msg_type = data.get("type", "")
+        if msg_type in ("assistant", "user"):
+            # Save new messages that were just appended to result.messages
+            for msg_data in result.messages:
+                mid = id(msg_data)
+                if mid in saved_turns:
+                    continue
+                saved_turns.add(mid)
+                role = msg_data.get("role", "")
+                if role == "user" and not msg_data.get("tool_name"):
+                    continue  # Skip echoed user prompts
+                await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
+
     cost_tracker = CostTracker(max_usd=settings.build_max_cost_usd)
-    runner = ClaudeCodeRunner(cost_tracker=cost_tracker, max_turns=settings.build_max_turns)
+    runner = ClaudeCodeRunner(cost_tracker=cost_tracker, max_turns=settings.build_max_turns, on_message=on_message)
 
     if chat.cli_session_id:
         code_result = await runner.resume(
@@ -228,13 +246,6 @@ async def _handle_code_chat(
             workspace_root=workspace.root_path,
             prompt=prompt,
         )
-
-    # Save messages — skip echoed user text prompts
-    for msg_data in code_result.messages:
-        role = msg_data.get("role", "")
-        if role == "user" and not msg_data.get("tool_name"):
-            continue
-        await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
 
     # Update chat
     new_status = "completed" if code_result.success else "failed"
