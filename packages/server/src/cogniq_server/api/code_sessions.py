@@ -114,6 +114,13 @@ async def continue_code_session(
     if session.status == "running":
         raise HTTPException(status_code=409, detail="Session is already running")
 
+    # Atomically set session to running — prevents concurrent continues
+    changed = await repo.update_code_session(
+        issue_id, session_id, {"status": "running"}, only_if_status=session.status,
+    )
+    if not changed:
+        raise HTTPException(status_code=409, detail="Session is already running (concurrent request)")
+
     # Get issue for project_id
     issue = await repo.get(issue_id)
     if not issue:
@@ -126,9 +133,6 @@ async def continue_code_session(
         content=body.prompt,
     )
     await repo.add_code_message(issue_id, session_id, user_msg)
-
-    # Set session status to running
-    await repo.update_code_session(issue_id, session_id, {"status": "running"})
 
     # Enqueue continue task
     task_id = await task_queue.enqueue(

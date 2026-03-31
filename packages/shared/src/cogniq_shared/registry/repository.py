@@ -171,13 +171,21 @@ class IssueRepository:
         )
         return session.session_id
 
-    async def update_code_session(self, issue_id: str, session_id: str, updates: dict[str, Any]) -> None:
+    async def update_code_session(
+        self, issue_id: str, session_id: str, updates: dict[str, Any], *, only_if_status: str | None = None,
+    ) -> bool:
+        """Update a code session. If only_if_status is set, only update when current status matches."""
         set_fields = {f"code_sessions.$.{k}": v for k, v in updates.items()}
         set_fields["updated_at"] = datetime.now(timezone.utc)
-        await self._col.update_one(
-            {"_id": issue_id, "code_sessions.session_id": session_id},
-            {"$set": set_fields},
-        )
+        if only_if_status:
+            query: dict[str, Any] = {
+                "_id": issue_id,
+                "code_sessions": {"$elemMatch": {"session_id": session_id, "status": only_if_status}},
+            }
+        else:
+            query: dict[str, Any] = {"_id": issue_id, "code_sessions.session_id": session_id}
+        result = await self._col.update_one(query, {"$set": set_fields})
+        return result.modified_count > 0
 
     async def add_code_message(self, issue_id: str, session_id: str, message: CodeMessage) -> None:
         await self._col.update_one(

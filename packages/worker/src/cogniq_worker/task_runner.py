@@ -97,7 +97,9 @@ async def _handle_continue(
             "error": code_result.error[:500] if code_result.error else None,
         }
         logger.info("Updating session %s: status=%s turns=%d", session_id, new_status, new_turns)
-        await repo.update_code_session(task.issue_id, session_id, updates)
+        updated = await repo.update_code_session(task.issue_id, session_id, updates, only_if_status="running")
+        if not updated:
+            logger.warning("Session %s was not in 'running' state — update may have been superseded", session_id)
     else:
         logger.warning("Session %s not found for issue %s — status update skipped", session_id, task.issue_id)
 
