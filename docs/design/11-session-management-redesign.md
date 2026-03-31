@@ -408,16 +408,19 @@ while running:
 - [x] Worker: `SessionRegistry` 도입 + `wait_first_done()` 비블록 패턴
 - [ ] SSE Broadcaster를 인메모리 Pub/Sub으로 교체 (Phase 3에서 Redis와 함께)
 
-### Phase 3 (개선): 실시간 스트리밍
-- [ ] `include_partial_messages=True` 활성화
-- [ ] 텍스트 청크 SSE 이벤트 (`text_chunk`) 추가
-- [ ] 툴 호출 실시간 알림 (`tool_start`, `tool_end`) 추가
-- [ ] Frontend: SSE 이벤트로 메시지를 점진적으로 렌더링
+### Phase 3 (완료): 실시간 스트리밍
+- [x] `include_partial_messages=True` 활성화
+- [x] 메시지 단위 즉시 DB 저장 (각 AssistantMessage/ToolUseBlock → MongoDB)
+- [x] SSE change stream이 변경 감지 → 프론트에 `session_update` push
+- [ ] 텍스트 청크 SSE 이벤트 (`text_chunk`) — Redis 도입 시 추가 예정
+- [ ] Frontend: 캐릭터 단위 점진 렌더링 — Redis 도입 시 추가 예정
 
-### Phase 4 (선택): 인터럽트
-- [ ] 인터럽트 API 엔드포인트 추가
-- [ ] drain 패턴 구현
-- [ ] Frontend: 인터럽트 버튼 추가
+### Phase 4 (완료): 인터럽트
+- [x] `interrupt_requested: bool` 필드 추가 (CodeSession 도메인)
+- [x] `POST /issues/{id}/code-sessions/{sid}/interrupt` API 엔드포인트
+- [x] Worker: `_watch_interrupt` 폴링 (2초) → `client.interrupt()` 호출
+- [x] `clear_interrupt` — ResultMessage 수신 시 플래그 초기화
+- [x] Frontend: Stop 버튼 (빨간색, StopCircle 아이콘)
 
 ---
 
