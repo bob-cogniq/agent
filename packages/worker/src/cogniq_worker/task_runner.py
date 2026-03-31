@@ -86,8 +86,9 @@ async def _handle_continue(
         }
         new_cost = session.total_cost_usd + code_result.total_cost_usd
 
+        new_status = "completed" if code_result.success else "failed"
         updates = {
-            "status": "completed" if code_result.success else "failed",
+            "status": new_status,
             "total_turns": new_turns,
             "total_tokens": new_tokens,
             "total_cost_usd": new_cost,
@@ -95,7 +96,10 @@ async def _handle_continue(
             "completed_at": datetime.now(timezone.utc),
             "error": code_result.error[:500] if code_result.error else None,
         }
+        logger.info("Updating session %s: status=%s turns=%d", session_id, new_status, new_turns)
         await repo.update_code_session(task.issue_id, session_id, updates)
+    else:
+        logger.warning("Session %s not found for issue %s — status update skipped", session_id, task.issue_id)
 
     status = "success" if code_result.success else "failed"
     return TaskResult(
