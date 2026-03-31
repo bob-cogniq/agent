@@ -229,10 +229,12 @@ async def _handle_code_chat(
             prompt=prompt,
         )
 
-    # Save messages — skip user role (already saved above or by API)
+    # Save messages — skip plain user text (already saved above or by API)
+    # Keep tool_use, tool_result, assistant messages
     for msg_data in code_result.messages:
-        if msg_data.get("role") == "user":
-            continue
+        role = msg_data.get("role", "")
+        if role == "user" and not msg_data.get("tool_name"):
+            continue  # Skip echoed user prompts, but keep tool_result
         await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
 
     # Update chat
@@ -248,18 +250,8 @@ async def _handle_code_chat(
         "total_cost_usd": chat.total_cost_usd + code_result.total_cost_usd,
     }, only_if_status="running")
 
-    # Drain queue if more messages
-    if task_queue:
-        next_msg = await chat_repo.pop_queued_message(chat_id)
-        if next_msg:
-            await chat_repo.enqueue_message(chat_id, next_msg)
-            await chat_repo.update(chat_id, {"status": "running"})
-            await task_queue.enqueue(
-                issue_id=chat_id,
-                project_id=task.project_id,
-                stage="code_chat",
-                config={"chat_id": chat_id},
-            )
+    # Don't create drain tasks here — continue API handles that.
+    # This prevents double execution of queued messages.
 
     return TaskResult(status="success")
 
