@@ -151,9 +151,8 @@ class IssueSessionManager:
                 idle_timeout = getattr(settings, "session_idle_timeout_seconds", 300)
                 while self._active:
                     try:
-                        session_id, prompt = await asyncio.wait_for(
-                            self._message_queue.get(), timeout=idle_timeout,
-                        )
+                        # Check both asyncio queue AND MongoDB queue
+                        session_id, prompt = await self._next_message(first_session_id, timeout=idle_timeout)
                         logger.info("Session %s processing queued message", self.issue_id)
                         await self._execute(client, session_id, prompt)
                     except asyncio.TimeoutError:
@@ -250,6 +249,40 @@ class IssueSessionManager:
 
             elif isinstance(message, StreamEvent):
                 pass  # Fine-grained events — handled by incremental saves above
+
+    async def _next_message(self, default_session_id: str, timeout: float) -> tuple[str, str]:
+        """Get the next message from asyncio queue OR MongoDB queue.
+
+        Checks asyncio queue first (instant). If empty, polls MongoDB
+        every 3 seconds up to `timeout`. Raises asyncio.TimeoutError
+        if no message arrives within the timeout.
+        """
+        elapsed = 0.0
+        poll_interval = 3.0
+        while elapsed < timeout:
+            # 1. Check in-memory asyncio queue (from Path A routing)
+            if not self._message_queue.empty():
+                return self._message_queue.get_nowait()
+
+            # 2. Check MongoDB queue (from API direct enqueue)
+            db_msg = await self._repo.pop_queued_message(self.issue_id, default_session_id)
+            if db_msg:
+                # Save user message to chat history
+                session = await self._repo.get_code_session(self.issue_id, default_session_id)
+                turn = (session.total_turns if session else 0) + 1
+                user_msg = CodeMessage(turn=turn, role="user", content=db_msg.prompt)
+                await self._repo.add_code_message(self.issue_id, default_session_id, user_msg)
+                await self._repo.update_code_session(self.issue_id, default_session_id, {"status": "running"})
+                return (default_session_id, db_msg.prompt)
+
+            # 3. Wait briefly before polling again
+            try:
+                result = await asyncio.wait_for(self._message_queue.get(), timeout=poll_interval)
+                return result
+            except asyncio.TimeoutError:
+                elapsed += poll_interval
+
+        raise asyncio.TimeoutError()
 
     # ── Phase 4: Interrupt watcher ──
 
