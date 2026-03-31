@@ -63,7 +63,6 @@ class ClaudeSDKRunner:
             permission_mode="bypassPermissions",
             max_turns=max_turns or self._max_turns,
             cwd=str(workspace_root),
-            include_partial_messages=True,
         )
         if allowed_tools:
             opts.allowed_tools = allowed_tools
@@ -159,6 +158,19 @@ class ClaudeSDKRunner:
 
     def _process_message(self, message: Any, result: ClaudeCodeResult, turn: int) -> int:
         """Update result from a single SDK message. Returns updated turn counter."""
+        # Log all messages for debugging
+        import json as _json
+        try:
+            if isinstance(message, StreamEvent):
+                event = message.event or {}
+                etype = event.get("type", "")
+                if etype not in ("content_block_delta", "content_block_start", "content_block_stop", "message_start", "message_delta", "message_stop", "ping"):
+                    logger.info("SDK StreamEvent: type=%s data=%s", etype, _json.dumps(event, default=str, ensure_ascii=False)[:200])
+            else:
+                logger.info("SDK msg: %s content=%s", type(message).__name__, str(getattr(message, 'content', ''))[:200])
+        except Exception:
+            pass
+
         if isinstance(message, AssistantMessage):
             turn += 1
             for block in message.content:
