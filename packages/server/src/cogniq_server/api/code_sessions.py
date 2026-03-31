@@ -127,8 +127,29 @@ async def continue_code_session(
     if session.status == "running":
         queued = QueuedMessage(prompt=body.prompt)
         await repo.enqueue_message(issue_id, session_id, queued)
-        logger.info("Message queued for running session %s (queue_length=%d)", session_id, len(session.message_queue) + 1)
-        return {"status": "queued", "queueLength": len(session.message_queue) + 1}
+        new_queue_len = len(session.message_queue) + 1
+        logger.info("Message queued for running session %s (queue_length=%d)", session_id, new_queue_len)
+
+        # Safety: if no active task exists for this issue, the session may be
+        # stale-running (worker died). Create a drain task to process the queue.
+        active_task = await task_queue.find_active(issue_id, stage="continue")
+        if not active_task:
+            logger.warning("No active continue task for running session %s — creating drain task", session_id)
+            issue = await repo.get(issue_id)
+            if issue:
+                drain_prompt = queued.prompt  # Worker will pop from DB queue
+                await task_queue.enqueue(
+                    issue_id=issue_id,
+                    project_id=issue.project_id,
+                    stage="continue",
+                    config={
+                        "session_id": session_id,
+                        "cli_session_id": session.cli_session_id,
+                        "prompt": drain_prompt,
+                    },
+                )
+
+        return {"status": "queued", "queueLength": new_queue_len}
 
     # Atomically set session to running — prevents concurrent continues
     changed = await repo.update_code_session(

@@ -72,6 +72,16 @@ class TaskQueueRepository:
         })
         return [doc async for doc in cursor]
 
+    async def find_active(self, issue_id: str, stage: str | None = None) -> dict[str, Any] | None:
+        """Find a pending/claimed/running task for an issue (optionally filtered by stage)."""
+        query: dict[str, Any] = {
+            "issue_id": issue_id,
+            "status": {"$in": [TaskStatus.PENDING, TaskStatus.CLAIMED, TaskStatus.RUNNING]},
+        }
+        if stage:
+            query["stage"] = stage
+        return await self._col.find_one(query)
+
     # ── Worker-side: claim / start / complete / fail / heartbeat ──
 
     async def claim(self, worker_id: str) -> TaskDocument | None:
