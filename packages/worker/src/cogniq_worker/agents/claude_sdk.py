@@ -130,16 +130,9 @@ class ClaudeSDKRunner:
 
         # If stream ended without ResultMessage (e.g., rate_limit_event),
         # retry with --resume to collect the remaining response
-        if not result.cli_session_id and not result.success and not result.error:
-            # No result at all — stream was empty or broken
-            result.success = False
-            result.error = "Stream ended without result"
-        elif result.cli_session_id and not any(
-            m.get("role") == "assistant" and isinstance(m.get("content"), str)
-            for m in result.messages
-        ):
-            # Got a session ID but no final text response — retry with resume
-            logger.warning("No final response — retrying with --resume %s", result.cli_session_id)
+        got_result = result.turns_used > 0  # ResultMessage sets turns_used
+        if not got_result and result.cli_session_id:
+            logger.warning("Stream ended without ResultMessage — retrying with --resume %s", result.cli_session_id)
             import asyncio as _asyncio
             await _asyncio.sleep(2)  # Wait for rate limit to clear
             retry_opts = ClaudeCodeOptions(
@@ -243,7 +236,9 @@ class ClaudeSDKRunner:
             )
 
         elif isinstance(message, StreamEvent):
-            # Pass-through for streaming — callers handle via on_event callback
-            pass
+            # Extract session_id from stream events (available before ResultMessage)
+            event = message.event or {}
+            if not result.cli_session_id and message.session_id:
+                result.cli_session_id = message.session_id
 
         return turn
