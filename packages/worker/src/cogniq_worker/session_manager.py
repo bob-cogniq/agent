@@ -175,6 +175,7 @@ class IssueSessionManager:
         logger.info("Session %s executing (session_id=%s)", self.issue_id, session_id)
         turn_offset = await self._get_turn_offset(session_id)
         turn = 0
+        got_result = False
 
         await client.query(prompt)
 
@@ -183,7 +184,6 @@ class IssueSessionManager:
                 turn += 1
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        # Phase 3: save immediately → SSE detects change
                         msg = CodeMessage(
                             turn=turn_offset + turn, role="assistant", content=block.text,
                         )
@@ -205,23 +205,22 @@ class IssueSessionManager:
                                 content=block.content, tool_name=block.tool_use_id,
                             )
                             await self._repo.add_code_message(self.issue_id, session_id, msg)
-                # Don't save user-typed prompts here (already saved by API)
 
             elif isinstance(message, ResultMessage):
+                got_result = True
                 if message.session_id:
                     self._cli_session_id = message.session_id
 
                 usage = message.usage or {}
                 session = await self._repo.get_code_session(self.issue_id, session_id)
                 if session:
-                    new_turns = session.total_turns + message.num_turns
                     new_status = "failed" if message.is_error else "completed"
                     await self._repo.update_code_session(
                         self.issue_id, session_id,
                         {
                             "status": new_status,
                             "cli_session_id": self._cli_session_id,
-                            "total_turns": new_turns,
+                            "total_turns": session.total_turns + message.num_turns,
                             "total_tokens": {
                                 "input": session.total_tokens.get("input", 0) + usage.get("input_tokens", 0),
                                 "output": session.total_tokens.get("output", 0) + usage.get("output_tokens", 0),
@@ -234,11 +233,17 @@ class IssueSessionManager:
                         only_if_status="running",
                     )
 
-                # Queue drain is handled by _next_message in the _run_loop.
-                # Don't pop here — avoids injecting user messages mid-stream.
-
             elif isinstance(message, StreamEvent):
-                pass  # Fine-grained events — handled by incremental saves above
+                pass
+
+        # Safety: if stream ended without ResultMessage, force status to completed
+        if not got_result:
+            logger.warning("Session %s: stream ended without ResultMessage — forcing completed", self.issue_id)
+            await self._repo.update_code_session(
+                self.issue_id, session_id,
+                {"status": "completed", "completed_at": datetime.now(timezone.utc)},
+                only_if_status="running",
+            )
 
     async def _next_message(self, default_session_id: str, timeout: float) -> tuple[str, str]:
         """Get the next message from asyncio queue OR MongoDB queue.
