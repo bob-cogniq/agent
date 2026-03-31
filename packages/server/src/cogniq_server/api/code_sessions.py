@@ -129,20 +129,21 @@ async def continue_code_session(
     new_queue_len = len(session.message_queue) + 1
 
     if session.status == "running":
-        # Session is active — worker will drain the queue automatically
-        # Safety: if no active task (stale session), create a drain task
+        # Session is active — check if a worker task is actually processing
         active_task = await task_queue.find_active(issue_id, stage="continue")
-        if not active_task:
-            logger.warning("No active task for running session %s — creating drain task", session_id)
-            await repo.update_code_session(issue_id, session_id, {"status": "completed"})
-            # Fall through to create task below
-        else:
+        if active_task:
+            # Worker is active — it will drain the queue after current execution
             return {"status": "queued", "queueLength": new_queue_len}
 
-    # Session is completed/failed — set running and create a task
-    # Worker will pop the FIRST message from the DB queue (FIFO)
+        # Stale: session is "running" but no worker task exists (worker died)
+        logger.warning("No active task for running session %s — resetting to create drain task", session_id)
+        await repo.update_code_session(issue_id, session_id, {"status": "completed"})
+
+    # Session is completed/failed — set running and create a drain task
+    # Use "completed" as the expected status (either original or just reset above)
+    current_status = "completed" if session.status == "running" else session.status
     changed = await repo.update_code_session(
-        issue_id, session_id, {"status": "running"}, only_if_status=session.status,
+        issue_id, session_id, {"status": "running"}, only_if_status=current_status,
     )
     if not changed:
         return {"status": "queued", "queueLength": new_queue_len}
