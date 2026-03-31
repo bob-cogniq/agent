@@ -30,6 +30,8 @@ async def run_agent(
         result = await agent.execute(task.issue_id)
     elif task.stage == "continue":
         return await _handle_continue(task, repo, workspace_mgr, task_queue, session_registry)
+    elif task.stage == "code_chat":
+        return await _handle_code_chat(task, workspace_mgr, task_queue, session_registry)
     else:
         return TaskResult(status="failed", error=f"Unknown stage: {task.stage}")
 
@@ -168,6 +170,94 @@ async def _handle_continue(
                     stage="continue",
                     config={"session_id": session_id, "cli_session_id": code_result.cli_session_id or cli_session_id},
                 )
+
+    return TaskResult(status="success")
+
+
+async def _handle_code_chat(
+    task: TaskDocument,
+    workspace_mgr: WorkspaceManager,
+    task_queue: TaskQueueRepository | None = None,
+    session_registry: "SessionRegistry | None" = None,  # type: ignore[name-defined]
+) -> TaskResult:
+    """Handle a standalone code chat task (not tied to an issue)."""
+    from cogniq_shared.domain.code_chat_repository import CodeChatRepository
+    from cogniq_shared.domain.code_session import CodeMessage
+    from cogniq_shared.registry.database import get_database
+
+    config = task.config or {}
+    chat_id = config.get("chat_id", "")
+    prompt = config.get("prompt", "")  # Only set for first message
+
+    db = get_database()
+    chat_repo = CodeChatRepository(db)
+
+    chat = await chat_repo.get(chat_id)
+    if not chat:
+        return TaskResult(status="failed", error="Chat not found")
+
+    # If no prompt in config, pop from queue (FIFO)
+    if not prompt:
+        first_msg = await chat_repo.pop_queued_message(chat_id)
+        if not first_msg:
+            return TaskResult(status="success")
+        prompt = first_msg.prompt
+        user_msg = CodeMessage(turn=chat.total_turns + 1, role="user", content=prompt)
+        await chat_repo.add_message(chat_id, user_msg)
+
+    # Get workspace
+    workspace = await workspace_mgr.get_workspace(task.project_id)
+    if not workspace:
+        return TaskResult(status="failed", error="Workspace not found")
+
+    # Use SDK runner
+    from cogniq_worker.agents.claude_sdk import ClaudeSDKRunner
+    from cogniq_worker.agents.base import CostTracker
+
+    cost_tracker = CostTracker(max_usd=settings.build_max_cost_usd)
+    runner = ClaudeSDKRunner(cost_tracker=cost_tracker, max_turns=settings.build_max_turns)
+
+    if chat.cli_session_id:
+        code_result = await runner.resume(
+            workspace_root=workspace.root_path,
+            cli_session_id=chat.cli_session_id,
+            prompt=prompt,
+        )
+    else:
+        code_result = await runner.run(
+            workspace_root=workspace.root_path,
+            prompt=prompt,
+        )
+
+    # Save messages
+    for msg_data in code_result.messages:
+        await chat_repo.add_message(chat_id, CodeMessage(**msg_data))
+
+    # Update chat
+    new_status = "completed" if code_result.success else "failed"
+    await chat_repo.update(chat_id, {
+        "status": new_status,
+        "cli_session_id": code_result.cli_session_id or chat.cli_session_id,
+        "total_turns": chat.total_turns + code_result.turns_used,
+        "total_tokens": {
+            "input": chat.total_tokens.get("input", 0) + code_result.total_input_tokens,
+            "output": chat.total_tokens.get("output", 0) + code_result.total_output_tokens,
+        },
+        "total_cost_usd": chat.total_cost_usd + code_result.total_cost_usd,
+    }, only_if_status="running")
+
+    # Drain queue if more messages
+    if task_queue:
+        next_msg = await chat_repo.pop_queued_message(chat_id)
+        if next_msg:
+            await chat_repo.enqueue_message(chat_id, next_msg)
+            await chat_repo.update(chat_id, {"status": "running"})
+            await task_queue.enqueue(
+                issue_id=chat_id,
+                project_id=task.project_id,
+                stage="code_chat",
+                config={"chat_id": chat_id},
+            )
 
     return TaskResult(status="success")
 
