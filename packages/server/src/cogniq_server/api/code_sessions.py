@@ -123,58 +123,35 @@ async def continue_code_session(
     if not session.cli_session_id:
         raise HTTPException(status_code=400, detail="Session cannot be continued (no CLI session ID)")
 
-    # If session is running → queue the message (Claude Desktop style)
-    if session.status == "running":
-        queued = QueuedMessage(prompt=body.prompt)
-        await repo.enqueue_message(issue_id, session_id, queued)
-        new_queue_len = len(session.message_queue) + 1
-        logger.info("Message queued for running session %s (queue_length=%d)", session_id, new_queue_len)
+    # Always enqueue the message to the DB queue — guarantees FIFO ordering
+    queued = QueuedMessage(prompt=body.prompt)
+    await repo.enqueue_message(issue_id, session_id, queued)
+    new_queue_len = len(session.message_queue) + 1
 
-        # Safety: if no active task exists for this issue, the session may be
-        # stale-running (worker died). Create a drain task to process the queue.
+    if session.status == "running":
+        # Session is active — worker will drain the queue automatically
+        # Safety: if no active task (stale session), create a drain task
         active_task = await task_queue.find_active(issue_id, stage="continue")
         if not active_task:
-            logger.warning("No active continue task for running session %s — creating drain task", session_id)
-            issue = await repo.get(issue_id)
-            if issue:
-                drain_prompt = queued.prompt  # Worker will pop from DB queue
-                await task_queue.enqueue(
-                    issue_id=issue_id,
-                    project_id=issue.project_id,
-                    stage="continue",
-                    config={
-                        "session_id": session_id,
-                        "cli_session_id": session.cli_session_id,
-                        "prompt": drain_prompt,
-                    },
-                )
+            logger.warning("No active task for running session %s — creating drain task", session_id)
+            await repo.update_code_session(issue_id, session_id, {"status": "completed"})
+            # Fall through to create task below
+        else:
+            return {"status": "queued", "queueLength": new_queue_len}
 
-        return {"status": "queued", "queueLength": new_queue_len}
-
-    # Atomically set session to running — prevents concurrent continues
+    # Session is completed/failed — set running and create a task
+    # Worker will pop the FIRST message from the DB queue (FIFO)
     changed = await repo.update_code_session(
         issue_id, session_id, {"status": "running"}, only_if_status=session.status,
     )
     if not changed:
-        # Race: another request beat us — queue instead
-        queued = QueuedMessage(prompt=body.prompt)
-        await repo.enqueue_message(issue_id, session_id, queued)
-        return {"status": "queued", "queueLength": 1}
+        return {"status": "queued", "queueLength": new_queue_len}
 
-    # Get issue for project_id
     issue = await repo.get(issue_id)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
 
-    # Save user prompt as a message immediately
-    user_msg = CodeMessage(
-        turn=session.total_turns + 1,
-        role="user",
-        content=body.prompt,
-    )
-    await repo.add_code_message(issue_id, session_id, user_msg)
-
-    # Enqueue continue task
+    # Enqueue a "drain" task — worker pops from DB queue, not from task config
     task_id = await task_queue.enqueue(
         issue_id=issue_id,
         project_id=issue.project_id,
@@ -182,11 +159,10 @@ async def continue_code_session(
         config={
             "session_id": session_id,
             "cli_session_id": session.cli_session_id,
-            "prompt": body.prompt,
         },
     )
 
-    return {"status": "queued", "taskId": task_id}
+    return {"status": "queued", "taskId": task_id, "queueLength": new_queue_len}
 
 
 @router.post("/issues/{issue_id}/code-sessions/{session_id}/interrupt")

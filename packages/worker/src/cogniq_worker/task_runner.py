@@ -62,10 +62,22 @@ async def _handle_continue(
     config = task.config or {}
     session_id = config.get("session_id", "")
     cli_session_id = config.get("cli_session_id", "")
-    prompt = config.get("prompt", "")
 
-    if not prompt:
-        return TaskResult(status="failed", error="Missing prompt in continue task config")
+    # Pop the FIRST message from DB queue (FIFO ordering)
+    first_msg = await repo.pop_queued_message(task.issue_id, session_id)
+    if not first_msg:
+        # Queue empty — nothing to process
+        logger.info("No queued messages for session %s — skipping", session_id)
+        return TaskResult(status="success")
+
+    prompt = first_msg.prompt
+
+    # Save user message to chat history
+    from cogniq_shared.domain.code_session import CodeMessage
+    session = await repo.get_code_session(task.issue_id, session_id)
+    turn = (session.total_turns if session else 0) + 1
+    user_msg = CodeMessage(turn=turn, role="user", content=prompt)
+    await repo.add_code_message(task.issue_id, session_id, user_msg)
 
     # ── Path A: Active persistent session ──
     if session_registry and session_registry.is_active(task.issue_id):
@@ -110,7 +122,6 @@ async def _handle_continue(
         # No registry — use SDK runner directly (stateless resume)
         from cogniq_worker.agents.claude_sdk import ClaudeSDKRunner
         from cogniq_worker.agents.base import CostTracker
-        from cogniq_shared.domain.code_session import CodeMessage
 
         cost_tracker = CostTracker(max_usd=settings.build_max_cost_usd)
         runner = ClaudeSDKRunner(cost_tracker=cost_tracker, max_turns=settings.build_max_turns)
@@ -122,18 +133,16 @@ async def _handle_continue(
         )
 
         for msg_data in code_result.messages:
-            msg = CodeMessage(**msg_data)
-            await repo.add_code_message(task.issue_id, session_id, msg)
+            await repo.add_code_message(task.issue_id, session_id, CodeMessage(**msg_data))
 
         session = await repo.get_code_session(task.issue_id, session_id)
         if session:
-            new_turns = session.total_turns + code_result.turns_used
             new_status = "completed" if code_result.success else "failed"
             await repo.update_code_session(
                 task.issue_id, session_id,
                 {
                     "status": new_status,
-                    "total_turns": new_turns,
+                    "total_turns": session.total_turns + code_result.turns_used,
                     "total_tokens": {
                         "input": session.total_tokens.get("input", 0) + code_result.total_input_tokens,
                         "output": session.total_tokens.get("output", 0) + code_result.total_output_tokens,
@@ -146,19 +155,18 @@ async def _handle_continue(
                 only_if_status="running",
             )
 
-        # Process any queued messages
+        # If more messages in queue, create next drain task
         if task_queue:
             next_msg = await repo.pop_queued_message(task.issue_id, session_id)
             if next_msg:
+                # Put it back — the next task will pop it
+                await repo.enqueue_message(task.issue_id, session_id, next_msg)
+                await repo.update_code_session(task.issue_id, session_id, {"status": "running"})
                 await task_queue.enqueue(
                     issue_id=task.issue_id,
                     project_id=issue.project_id,
                     stage="continue",
-                    config={
-                        "session_id": session_id,
-                        "cli_session_id": code_result.cli_session_id or cli_session_id,
-                        "prompt": next_msg.prompt,
-                    },
+                    config={"session_id": session_id, "cli_session_id": code_result.cli_session_id or cli_session_id},
                 )
 
     return TaskResult(status="success")
